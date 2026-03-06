@@ -1,0 +1,7 @@
+# Guesty Open API credentials
+# Get these from: Guesty Dashboard → Integrations → API & Webhooks → Create App
+GUESTY_CLIENT_ID=your_client_id_here
+GUESTY_CLIENT_SECRET=your_client_secret_here
+
+# Port (Render sets this automatically)
+PORT=3001

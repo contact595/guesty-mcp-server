@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: guesty-mcp
+    env: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: GUESTY_CLIENT_ID
+        sync: false
+      - key: GUESTY_CLIENT_SECRET
+        sync: false
+    healthCheckPath: /health
