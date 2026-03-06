@@ -53,7 +53,7 @@ async function guestyRequest(method, path, params = {}, body = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// OAuth 2.1 Endpoints
+// OAuth 2.1 Endpoints (required by Claude.ai)
 // ═══════════════════════════════════════════════════════════════════════════
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
@@ -79,12 +79,8 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
 
 app.post("/register", (req, res) => {
   const clientId = `claude_${crypto.randomBytes(8).toString("hex")}`;
-  clients[clientId] = {
-    client_id: clientId,
-    redirect_uris: req.body.redirect_uris || [],
-    client_name: req.body.client_name || "Claude",
-  };
-  console.log(`[OAuth] Registered client: ${clientId}`);
+  clients[clientId] = { client_id: clientId, redirect_uris: req.body.redirect_uris || [], client_name: req.body.client_name || "Claude" };
+  console.log(`[OAuth] Registered: ${clientId}`);
   res.status(201).json({
     client_id: clientId,
     client_secret_expires_at: 0,
@@ -95,21 +91,20 @@ app.post("/register", (req, res) => {
   });
 });
 
-// Auto-approve: generate code and immediately redirect back to Claude
 app.get("/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
   if (!client_id || !redirect_uri) return res.status(400).send("Missing required params");
 
   const code = crypto.randomBytes(16).toString("hex");
   authCodes[code] = { client_id, redirect_uri, code_challenge, code_challenge_method, created_at: Date.now() };
-  console.log(`[OAuth] Issuing code for client: ${client_id}`);
+  console.log(`[OAuth] Auth code issued for: ${client_id}`);
 
   try {
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set("code", code);
-    if (state) redirectUrl.searchParams.set("state", state);
-    res.redirect(redirectUrl.toString());
-  } catch (err) {
+    const url = new URL(redirect_uri);
+    url.searchParams.set("code", code);
+    if (state) url.searchParams.set("state", state);
+    res.redirect(url.toString());
+  } catch (e) {
     res.status(400).send("Invalid redirect_uri");
   }
 });
@@ -119,9 +114,11 @@ app.post("/token", (req, res) => {
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
 
   const authCode = authCodes[code];
-  if (!authCode) return res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired code" });
+  if (!authCode) {
+    console.log(`[OAuth] Invalid code: ${code}, stored codes: ${Object.keys(authCodes).join(", ")}`);
+    return res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired code" });
+  }
 
-  // PKCE verification
   if (authCode.code_challenge && code_verifier) {
     const hash = crypto.createHash("sha256").update(code_verifier).digest("base64url");
     if (hash !== authCode.code_challenge) return res.status(400).json({ error: "invalid_grant", error_description: "PKCE failed" });
@@ -136,12 +133,12 @@ app.post("/token", (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MCP Tools
+// Build MCP Server (tools)
 // ═══════════════════════════════════════════════════════════════════════════
 function buildMcpServer() {
-  const server = new McpServer({ name: "guesty-mcp", version: "2.0.0" });
+  const server = new McpServer({ name: "guesty-mcp", version: "3.0.0" });
 
-  server.tool("list_listings", "Get all Guesty property listings",
+  server.tool("list_listings", "Get all Guesty property listings for Ventur Group",
     { limit: z.number().optional().default(25), skip: z.number().optional().default(0) },
     async ({ limit, skip }) => {
       const data = await guestyRequest("GET", "/listings", { limit, skip, fields: "_id nickname title address type" });
@@ -150,7 +147,7 @@ function buildMcpServer() {
     }
   );
 
-  server.tool("get_listing", "Get full details for a single listing",
+  server.tool("get_listing", "Get full details for a single Guesty listing",
     { listing_id: z.string() },
     async ({ listing_id }) => {
       const data = await guestyRequest("GET", `/listings/${listing_id}`);
@@ -158,7 +155,7 @@ function buildMcpServer() {
     }
   );
 
-  server.tool("list_reservations", "Get reservations with optional filters",
+  server.tool("list_reservations", "Get reservations with optional filters by listing, status, and date range",
     {
       listing_id: z.string().optional(),
       status: z.enum(["inquiry","reserved","confirmed","canceled","declined","expired","closed","checked_in","checked_out"]).optional(),
@@ -205,7 +202,7 @@ function buildMcpServer() {
     }
   );
 
-  server.tool("list_guests", "Search guests by name or email",
+  server.tool("list_guests", "Search Guesty guests by name or email",
     { search: z.string().optional(), limit: z.number().optional().default(20), skip: z.number().optional().default(0) },
     async ({ search, limit, skip }) => {
       const params = { limit, skip };
@@ -224,7 +221,7 @@ function buildMcpServer() {
     }
   );
 
-  server.tool("send_guest_message", "Send a message to a guest",
+  server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
     { reservation_id: z.string(), message: z.string() },
     async ({ reservation_id, message }) => {
       const data = await guestyRequest("POST", `/conversations/${reservation_id}/messages`, {}, { body: message, type: "host" });
@@ -252,30 +249,54 @@ function buildMcpServer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Streamable HTTP MCP Endpoint (Claude.ai uses this)
+// Streamable HTTP MCP Endpoint
+// Key fix: create transport ONCE, connect server ONCE, reuse for all requests
+// Pass req.body as third arg to handleRequest
 // ═══════════════════════════════════════════════════════════════════════════
-app.all("/mcp", async (req, res) => {
+const mcpServer = buildMcpServer();
+const mcpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
+// Connect once at startup
+mcpServer.connect(mcpTransport).then(() => {
+  console.log("MCP server connected to transport");
+}).catch(err => {
+  console.error("Failed to connect MCP server:", err);
+});
+
+app.post("/mcp", async (req, res) => {
   try {
-    const server = buildMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless
-    });
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+    await mcpTransport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error("[MCP] Error:", err);
+    console.error("[MCP POST error]", err);
+    if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/mcp", async (req, res) => {
+  try {
+    await mcpTransport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("[MCP GET error]", err);
+    if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/mcp", async (req, res) => {
+  try {
+    await mcpTransport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("[MCP DELETE error]", err);
     if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ─── Health ──────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "guesty-mcp", version: "3.0.0", transport: "streamable-http" });
+  res.json({ status: "ok", service: "guesty-mcp", version: "4.0.0", transport: "streamable-http" });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Guesty MCP v3 running on port ${PORT}`);
+  console.log(`Guesty MCP v4 running on port ${PORT}`);
   console.log(`MCP endpoint: ${BASE_URL}/mcp`);
-  console.log(`OAuth metadata: ${BASE_URL}/.well-known/oauth-authorization-server`);
 });
