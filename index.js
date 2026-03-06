@@ -263,10 +263,10 @@ function buildMcpServer() {
   server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
     { reservation_id: z.string(), message: z.string() },
     async ({ reservation_id, message }) => {
-      const list = await guestyRequest("GET", "/conversations", { reservationId: reservation_id, limit: 1 });
+      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
       const conversation = (list.results || list)[0];
       if (!conversation) throw new Error("No conversation found for this reservation");
-      const data = await guestyRequest("POST", `/conversations/${conversation._id}/messages`, {}, { body: message, type: "host" });
+      const data = await guestyRequest("POST", `/communication/conversations/${conversation._id}/send-message`, {}, { body: message, type: "host" });
       return { content: [{ type: "text", text: JSON.stringify({ success: true, messageId: data._id }) }] };
     }
   );
@@ -275,11 +275,11 @@ function buildMcpServer() {
   server.tool("get_conversation", "Get the message thread for a reservation",
     { reservation_id: z.string() },
     async ({ reservation_id }) => {
-      const list = await guestyRequest("GET", "/conversations", { reservationId: reservation_id, limit: 1 });
+      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
       console.log(`[get_conversation] /conversations?reservationId=${reservation_id} => count: ${(list.results || list).length}`);
       const conversation = (list.results || list)[0];
       if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", reservation_id }) }] };
-      const data = await guestyRequest("GET", `/conversations/${conversation._id}`);
+      const data = await guestyRequest("GET", `/communication/conversations/${conversation._id}/posts`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
