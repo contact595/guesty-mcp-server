@@ -39,7 +39,13 @@ async function getGuestyToken() {
   return cachedToken;
 }
 
-async function guestyRequest(method, path, params = {}, body = null) {
+// ─── Sleep helper ─────────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─── Guesty request with automatic 429 retry ─────────────────────────────────
+async function guestyRequest(method, path, params = {}, body = null, retries = 3) {
   const token = await getGuestyToken();
   const config = {
     method,
@@ -48,17 +54,35 @@ async function guestyRequest(method, path, params = {}, body = null) {
   };
   if (method === "GET" && Object.keys(params).length) {
     config.params = params;
-    config.paramsSerializer = (p) => Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+    config.paramsSerializer = (p) =>
+      Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
   }
-  if (body) { config.data = body; config.headers["Content-Type"] = "application/json"; }
-  try {
-    const res = await axios(config);
-    return res.data;
-  } catch (err) {
-    const status = err.response?.status;
-    const detail = JSON.stringify(err.response?.data || err.message);
-    console.error(`[Guesty Error] ${method} ${path} => ${status}: ${detail}`);
-    throw err;
+  if (body) {
+    config.data = body;
+    config.headers["Content-Type"] = "application/json";
+  }
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await axios(config);
+      return res.data;
+    } catch (err) {
+      const status = err.response?.status;
+      const retryAfter = err.response?.headers?.["retry-after"];
+      const detail = JSON.stringify(err.response?.data || err.message);
+
+      console.error(`[Guesty] ${method} ${path} => ${status} (attempt ${attempt}/${retries}): ${detail}`);
+
+      if (status === 429 && attempt < retries) {
+        // Honour Guesty's Retry-After header, or back off exponentially
+        const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 1000;
+        console.log(`[Guesty] Rate limited. Waiting ${waitMs}ms before retry...`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      throw err;
+    }
   }
 }
 
@@ -251,14 +275,10 @@ function buildMcpServer() {
   server.tool("get_conversation", "Get the message thread for a reservation",
     { reservation_id: z.string() },
     async ({ reservation_id }) => {
-      const list = await guestyRequest("GET", "/conversations", { reservationId: reservation_id, limit: 10 });
-      console.log(`[get_conversation] raw response keys:`, Object.keys(list), `count:`, (list.results||list).length);
-      let results = list.results || list;
-      if (Array.isArray(results)) {
-        results = results.filter(c => c.reservationId === reservation_id || c.reservation?._id === reservation_id);
-      }
-      const conversation = Array.isArray(results) ? results[0] : null;
-      if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", debug: { reservation_id, rawCount: (list.results||list).length } }) }] };
+      const list = await guestyRequest("GET", "/conversations", { reservationId: reservation_id, limit: 1 });
+      console.log(`[get_conversation] /conversations?reservationId=${reservation_id} => count: ${(list.results || list).length}`);
+      const conversation = (list.results || list)[0];
+      if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", reservation_id }) }] };
       const data = await guestyRequest("GET", `/conversations/${conversation._id}`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
@@ -277,14 +297,13 @@ function buildMcpServer() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Streamable HTTP MCP Endpoint — stateless mode
-// New transport per request (required for stateless), shared McpServer instance
 // ═══════════════════════════════════════════════════════════════════════════
 const mcpServer = buildMcpServer();
 
 async function handleMcpRequest(req, res) {
   try {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless — no session tracking
+      sessionIdGenerator: undefined,
     });
     await mcpServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
