@@ -46,7 +46,10 @@ async function guestyRequest(method, path, params = {}, body = null) {
     url: `https://open-api.guesty.com/v1${path}`,
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   };
-  if (method === "GET" && Object.keys(params).length) config.params = params;
+  if (method === "GET" && Object.keys(params).length) {
+  config.params = params;
+  config.paramsSerializer = (p) => Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+}
   if (body) { config.data = body; config.headers["Content-Type"] = "application/json"; }
   const res = await axios(config);
   return res.data;
@@ -165,11 +168,13 @@ function buildMcpServer() {
       skip: z.number().optional().default(0),
     },
     async ({ listing_id, status, check_in_from, check_in_to, limit, skip }) => {
-      const params = { limit, skip };
-      if (listing_id) params['filters[listingId][$in][0]'] = listing_id;
-      if (status) params.status = status;
-      if (check_in_from) params['checkIn[$gte]'] = check_in_from;
-      if (check_in_to) params['checkIn[$lte]'] = check_in_to;
+      const filters = [];
+      if (listing_id) filters.push({ field: "listingId", operator: "$in", value: [listing_id] });
+      if (status) filters.push({ field: "status", operator: "$eq", value: status });
+      if (check_in_from) filters.push({ field: "checkInDateLocalized", operator: "$gte", value: check_in_from });
+      if (check_in_to) filters.push({ field: "checkInDateLocalized", operator: "$lte", value: check_in_to });
+      const params = { limit, skip, sort: "_id" };
+      if (filters.length) params.filters = JSON.stringify(filters);
       const data = await guestyRequest("GET", "/reservations", params);
       const out = (data.results || data).map(r => ({
         id: r._id, confirmationCode: r.confirmationCode, status: r.status,
