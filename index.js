@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 const GUESTY_API = "https://open-api.guesty.com/v1";
-const TOKEN_URL = "https://auth.guesty.com/oauth/token";
+const TOKEN_URL = "https://open-api.guesty.com/oauth2/token";
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 let cachedToken = null;
@@ -14,15 +14,15 @@ async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   let res;
   try {
+    const params = new URLSearchParams();
+    params.append("grant_type", "client_credentials");
+    params.append("scope", "open-api");
+    params.append("client_id", process.env.GUESTY_CLIENT_ID);
+    params.append("client_secret", process.env.GUESTY_CLIENT_SECRET);
     res = await fetch(TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "client_credentials",
-        scope: "open-api",
-        client_id: process.env.GUESTY_CLIENT_ID,
-        client_secret: process.env.GUESTY_CLIENT_SECRET,
-      }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
     });
   } catch (e) {
     console.error("getToken fetch error:", e.message, e.cause?.message || "", e.cause?.code || "");
@@ -409,10 +409,15 @@ app.get("/health", async (req, res) => {
   };
   let tokenTest = null;
   try {
+    const hp = new URLSearchParams();
+    hp.append("grant_type", "client_credentials");
+    hp.append("scope", "open-api");
+    hp.append("client_id", clientId);
+    hp.append("client_secret", clientSecret);
     const r = await fetch(TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ grant_type: "client_credentials", scope: "open-api", client_id: clientId, client_secret: clientSecret }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: hp.toString(),
     });
     const d = await r.json();
     tokenTest = r.ok ? `OK (token length=${d.access_token?.length})` : `FAILED ${r.status}: ${JSON.stringify(d)}`;
