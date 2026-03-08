@@ -13,12 +13,10 @@ app.use(express.urlencoded({ extended: true }));
 
 const BASE_URL = process.env.BASE_URL || "https://guesty-mcp.onrender.com";
 
-// ─── In-memory OAuth stores ──────────────────────────────────────────────────
 const clients = {};
 const authCodes = {};
 const accessTokens = {};
 
-// ─── Guesty Token Cache ──────────────────────────────────────────────────────
 let cachedToken = null;
 let tokenExpiresAt = null;
 
@@ -39,12 +37,10 @@ async function getGuestyToken() {
   return cachedToken;
 }
 
-// ─── Sleep helper ─────────────────────────────────────────────────────────────
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ─── Guesty request with automatic 429 retry ─────────────────────────────────
 async function guestyRequest(method, path, params = {}, body = null, retries = 3) {
   const token = await getGuestyToken();
   const config = {
@@ -70,32 +66,20 @@ async function guestyRequest(method, path, params = {}, body = null, retries = 3
       const status = err.response?.status;
       const retryAfter = err.response?.headers?.["retry-after"];
       const detail = JSON.stringify(err.response?.data || err.message);
-
       console.error(`[Guesty] ${method} ${path} => ${status} (attempt ${attempt}/${retries}): ${detail}`);
-
       if (status === 429 && attempt < retries) {
-        // Honour Guesty's Retry-After header, or back off exponentially
         const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 1000;
         console.log(`[Guesty] Rate limited. Waiting ${waitMs}ms before retry...`);
         await sleep(waitMs);
         continue;
       }
-
       throw err;
     }
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// OAuth 2.1 Endpoints (required by Claude.ai)
-// ═══════════════════════════════════════════════════════════════════════════
-
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.json({
-    resource: BASE_URL,
-    authorization_servers: [BASE_URL],
-    bearer_methods_supported: ["header"],
-  });
+  res.json({ resource: BASE_URL, authorization_servers: [BASE_URL], bearer_methods_supported: ["header"] });
 });
 
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
@@ -116,11 +100,9 @@ app.post("/register", (req, res) => {
   clients[clientId] = { client_id: clientId, redirect_uris: req.body.redirect_uris || [], client_name: req.body.client_name || "Claude" };
   console.log(`[OAuth] Registered: ${clientId}`);
   res.status(201).json({
-    client_id: clientId,
-    client_secret_expires_at: 0,
+    client_id: clientId, client_secret_expires_at: 0,
     redirect_uris: clients[clientId].redirect_uris,
-    grant_types: ["authorization_code"],
-    response_types: ["code"],
+    grant_types: ["authorization_code"], response_types: ["code"],
     client_name: clients[clientId].client_name,
   });
 });
@@ -128,11 +110,9 @@ app.post("/register", (req, res) => {
 app.get("/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
   if (!client_id || !redirect_uri) return res.status(400).send("Missing required params");
-
   const code = crypto.randomBytes(16).toString("hex");
   authCodes[code] = { client_id, redirect_uri, code_challenge, code_challenge_method, created_at: Date.now() };
   console.log(`[OAuth] Auth code issued for: ${client_id}`);
-
   try {
     const url = new URL(redirect_uri);
     url.searchParams.set("code", code);
@@ -146,29 +126,22 @@ app.get("/authorize", (req, res) => {
 app.post("/token", (req, res) => {
   const { grant_type, code, code_verifier } = req.body;
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
-
   const authCode = authCodes[code];
   if (!authCode) {
-    console.log(`[OAuth] Invalid code: ${code}, stored codes: ${Object.keys(authCodes).join(", ")}`);
+    console.log(`[OAuth] Invalid code: ${code}`);
     return res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired code" });
   }
-
   if (authCode.code_challenge && code_verifier) {
     const hash = crypto.createHash("sha256").update(code_verifier).digest("base64url");
     if (hash !== authCode.code_challenge) return res.status(400).json({ error: "invalid_grant", error_description: "PKCE failed" });
   }
-
   const accessToken = crypto.randomBytes(32).toString("hex");
   accessTokens[accessToken] = { client_id: authCode.client_id, expires_at: Date.now() + 365 * 24 * 60 * 60 * 1000 };
   delete authCodes[code];
-
   console.log(`[OAuth] Token issued for: ${authCode.client_id}`);
   res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 31536000 });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Build MCP Server (tools)
-// ═══════════════════════════════════════════════════════════════════════════
 function buildMcpServer() {
   const server = new McpServer({ name: "guesty-mcp", version: "3.0.0" });
 
@@ -259,46 +232,47 @@ function buildMcpServer() {
     }
   );
 
-  // ── Helper: find conversation by reservation ID ────────────────────────────
+  // ── Helper: paginate through all conversations to find by reservation ID ───
   async function findConversation(reservation_id) {
-    // Strategy 1: filters JSON array (like /reservations endpoint)
-    try {
-      const filters = JSON.stringify([{ field: "reservationId", operator: "$eq", value: reservation_id }]);
-      const list = await guestyRequest("GET", "/communication/conversations", { filters, limit: 1 });
-      const results = list.data?.conversations || list.results || list.conversations || [];
-      if (Array.isArray(results) && results.length > 0) return results[0];
-    } catch (e) {
-      console.log(`[findConversation] filters strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
-    }
+    let cursor = null;
+    let page = 0;
 
-    // Strategy 2: plain reservationId param (old attempt)
-    try {
-      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
-      const results = list.data?.conversations || list.results || list.conversations || [];
-      if (Array.isArray(results) && results.length > 0) return results[0];
-    } catch (e) {
-      console.log(`[findConversation] reservationId strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
-    }
+    while (page < 15) {
+      const params = { limit: 100 };
+      if (cursor) params.after = cursor;
 
-    // Strategy 3: no filter — get all, find by scanning
-    try {
-      const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
-      const results = list.data?.conversations || list.results || list.conversations || [];
-      if (Array.isArray(results)) {
-        const match = results.find(c =>
-          c.reservationId === reservation_id ||
-          (c.meta?.reservations || []).some(r => r._id === reservation_id)
-        );
-        if (match) return match;
+      const list = await guestyRequest("GET", "/communication/conversations", params);
+      const data = list.data || list;
+      const conversations = data.conversations || data.results || [];
+
+      if (!Array.isArray(conversations) || conversations.length === 0) {
+        console.log(`[findConversation] no more conversations at page ${page}`);
+        break;
       }
-    } catch (e) {
-      console.log(`[findConversation] no-filter strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
+
+      const match = conversations.find(c =>
+        (c.meta?.reservations || []).some(r => r._id === reservation_id)
+      );
+
+      if (match) {
+        console.log(`[findConversation] found conversation ${match._id} on page ${page}`);
+        return match;
+      }
+
+      cursor = data.cursor?.after;
+      if (!cursor) {
+        console.log(`[findConversation] no cursor after page ${page}`);
+        break;
+      }
+
+      page++;
+      await sleep(300);
     }
 
+    console.log(`[findConversation] not found after ${page} pages for ${reservation_id}`);
     return null;
   }
 
-  // ── send_guest_message ─────────────────────────────────────────────────────
   server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
     { reservation_id: z.string(), message: z.string() },
     async ({ reservation_id, message }) => {
@@ -309,13 +283,12 @@ function buildMcpServer() {
     }
   );
 
-  // ── get_conversation ───────────────────────────────────────────────────────
   server.tool("get_conversation", "Get the message thread for a reservation",
     { reservation_id: z.string() },
     async ({ reservation_id }) => {
       const conversation = await findConversation(reservation_id);
       if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", reservation_id }) }] };
-      console.log(`[get_conversation] found conversation ${conversation._id} for reservation ${reservation_id}`);
+      console.log(`[get_conversation] fetching posts for conversation ${conversation._id}`);
       const data = await guestyRequest("GET", `/communication/conversations/${conversation._id}/posts`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
@@ -332,16 +305,11 @@ function buildMcpServer() {
   return server;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Streamable HTTP MCP Endpoint — stateless mode
-// ═══════════════════════════════════════════════════════════════════════════
 const mcpServer = buildMcpServer();
 
 async function handleMcpRequest(req, res) {
   try {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await mcpServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
     res.on("finish", () => transport.close());
@@ -356,32 +324,18 @@ app.post("/mcp", handleMcpRequest);
 app.get("/mcp", handleMcpRequest);
 app.delete("/mcp", handleMcpRequest);
 
-// ─── Health ──────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "guesty-mcp", version: "4.0.0", transport: "streamable-http" });
 });
+
 app.get('/test', async (req, res) => {
   const { reservation_id } = req.query;
   if (!reservation_id) return res.json({ error: "Pass ?reservation_id=YOUR_ID" });
   try {
-    // Strategy 1: filters array
-    const s1 = await guestyRequest("GET", "/communication/conversations", {
-      filters: JSON.stringify([{ field: "reservationId", operator: "$eq", value: reservation_id }]),
-      limit: 5
-    }).catch(e => ({ error: e.response?.status, detail: e.response?.data }));
-
-    // Strategy 2: plain param
-    const s2 = await guestyRequest("GET", "/communication/conversations", {
-      reservationId: reservation_id, limit: 5
-    }).catch(e => ({ error: e.response?.status, detail: e.response?.data }));
-
-    // Strategy 3: no filter, raw list
-    const s3 = await guestyRequest("GET", "/communication/conversations", { limit: 10 })
-      .catch(e => ({ error: e.response?.status, detail: e.response?.data }));
-
-    res.json({ reservation_id, strategy1: s1, strategy2: s2, strategy3_sample: s3 });
+    const result = await guestyRequest("GET", "/communication/conversations", { limit: 5 });
+    res.json({ raw: result, reservation_id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message, status: err.response?.status });
   }
 });
 
