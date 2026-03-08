@@ -78,6 +78,10 @@ async function guestyRequest(method, path, params = {}, body = null, retries = 3
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// OAuth 2.1 Endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({ resource: BASE_URL, authorization_servers: [BASE_URL], bearer_methods_supported: ["header"] });
 });
@@ -142,6 +146,9 @@ app.post("/token", (req, res) => {
   res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 31536000 });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MCP Tools
+// ═══════════════════════════════════════════════════════════════════════════
 function buildMcpServer() {
   const server = new McpServer({ name: "guesty-mcp", version: "3.0.0" });
 
@@ -232,45 +239,37 @@ function buildMcpServer() {
     }
   );
 
-  // ── Helper: paginate through all conversations to find by reservation ID ───
+  // ── Helper: find conversation using 2-step guest lookup (2 API calls max) ──
   async function findConversation(reservation_id) {
-    let cursor = null;
-    let page = 0;
+    // Step 1: get reservation to extract guestId
+    console.log(`[findConversation] fetching reservation ${reservation_id}`);
+    const reservation = await guestyRequest("GET", `/reservations/${reservation_id}`);
+    const guestId = reservation.guestId || reservation.guest?._id;
 
-    while (page < 15) {
-      const params = { limit: 100 };
-      if (cursor) params.after = cursor;
-
-      const list = await guestyRequest("GET", "/communication/conversations", params);
-      const data = list.data || list;
-      const conversations = data.conversations || data.results || [];
-
-      if (!Array.isArray(conversations) || conversations.length === 0) {
-        console.log(`[findConversation] no more conversations at page ${page}`);
-        break;
-      }
-
-      const match = conversations.find(c =>
-        (c.meta?.reservations || []).some(r => r._id === reservation_id)
-      );
-
-      if (match) {
-        console.log(`[findConversation] found conversation ${match._id} on page ${page}`);
-        return match;
-      }
-
-      cursor = data.cursor?.after;
-      if (!cursor) {
-        console.log(`[findConversation] no cursor after page ${page}`);
-        break;
-      }
-
-      page++;
-      await sleep(300);
+    if (!guestId) {
+      console.log(`[findConversation] no guestId found on reservation ${reservation_id}`);
+      return null;
     }
 
-    console.log(`[findConversation] not found after ${page} pages for ${reservation_id}`);
-    return null;
+    console.log(`[findConversation] looking up conversations for guestId ${guestId}`);
+
+    // Step 2: query conversations filtered by guestId
+    const filters = JSON.stringify([{ field: "guestId", operator: "$eq", value: guestId }]);
+    const list = await guestyRequest("GET", "/communication/conversations", { filters, limit: 10 });
+    const conversations = list.data?.conversations || list.conversations || list.results || [];
+
+    if (!Array.isArray(conversations) || conversations.length === 0) {
+      console.log(`[findConversation] no conversations found for guestId ${guestId}`);
+      return null;
+    }
+
+    // Find the conversation that matches this specific reservation
+    const match = conversations.find(c =>
+      (c.meta?.reservations || []).some(r => r._id === reservation_id)
+    ) || conversations[0]; // fallback to most recent if only one guest conversation exists
+
+    console.log(`[findConversation] found conversation ${match._id}`);
+    return match;
   }
 
   server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
@@ -305,6 +304,9 @@ function buildMcpServer() {
   return server;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Streamable HTTP MCP Endpoint
+// ═══════════════════════════════════════════════════════════════════════════
 const mcpServer = buildMcpServer();
 
 async function handleMcpRequest(req, res) {
@@ -324,18 +326,29 @@ app.post("/mcp", handleMcpRequest);
 app.get("/mcp", handleMcpRequest);
 app.delete("/mcp", handleMcpRequest);
 
+// ─── Health ──────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "guesty-mcp", version: "4.0.0", transport: "streamable-http" });
 });
 
+// ─── Test endpoint ────────────────────────────────────────────────────────────
 app.get('/test', async (req, res) => {
   const { reservation_id } = req.query;
   if (!reservation_id) return res.json({ error: "Pass ?reservation_id=YOUR_ID" });
   try {
-    const result = await guestyRequest("GET", "/communication/conversations", { limit: 5 });
-    res.json({ raw: result, reservation_id });
+    // Step 1: get reservation
+    const reservation = await guestyRequest("GET", `/reservations/${reservation_id}`);
+    const guestId = reservation.guestId || reservation.guest?._id;
+
+    if (!guestId) return res.json({ error: "No guestId on reservation", reservation_id });
+
+    // Step 2: get conversations by guestId
+    const filters = JSON.stringify([{ field: "guestId", operator: "$eq", value: guestId }]);
+    const list = await guestyRequest("GET", "/communication/conversations", { filters, limit: 10 });
+
+    res.json({ reservation_id, guestId, raw_conversations: list });
   } catch (err) {
-    res.status(500).json({ error: err.message, status: err.response?.status });
+    res.status(500).json({ error: err.message, status: err.response?.status, detail: err.response?.data });
   }
 });
 
