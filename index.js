@@ -12,19 +12,35 @@ let tokenExpiry = 0;
 
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "client_credentials",
-      scope: "open-api",
-      client_id: process.env.GUESTY_CLIENT_ID,
-      client_secret: process.env.GUESTY_CLIENT_SECRET,
-    }),
-  });
+  let res;
+  try {
+    res = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        scope: "open-api",
+        client_id: process.env.GUESTY_CLIENT_ID,
+        client_secret: process.env.GUESTY_CLIENT_SECRET,
+      }),
+    });
+  } catch (e) {
+    console.error("getToken fetch error:", e.message, e.cause?.message || "", e.cause?.code || "");
+    throw e;
+  }
+  if (!res.ok) {
+    const body = await res.text();
+    console.error("getToken HTTP error:", res.status, body);
+    throw new Error(`Auth failed ${res.status}: ${body}`);
+  }
   const data = await res.json();
+  if (!data.access_token) {
+    console.error("getToken: no access_token in response:", JSON.stringify(data));
+    throw new Error("No access_token in auth response");
+  }
   cachedToken = data.access_token;
   tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  console.log("getToken: OK, expires in", data.expires_in, "s");
   return cachedToken;
 }
 
@@ -401,7 +417,7 @@ app.get("/health", async (req, res) => {
     const d = await r.json();
     tokenTest = r.ok ? `OK (token length=${d.access_token?.length})` : `FAILED ${r.status}: ${JSON.stringify(d)}`;
   } catch (e) {
-    tokenTest = `FETCH ERROR: ${e.message}`;
+    tokenTest = `FETCH ERROR: ${e.message} | cause: ${e.cause?.message || 'none'} | code: ${e.cause?.code || 'none'}`;
   }
   res.json({ env: envStatus, tokenTest, cacheReady, cacheSize: conversationCache.size });
 });
