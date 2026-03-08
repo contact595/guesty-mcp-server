@@ -265,7 +265,7 @@ function buildMcpServer() {
     try {
       const filters = JSON.stringify([{ field: "reservationId", operator: "$eq", value: reservation_id }]);
       const list = await guestyRequest("GET", "/communication/conversations", { filters, limit: 1 });
-      const results = list.results || list;
+      const results = list.results || list.conversations || list;
       if (Array.isArray(results) && results.length > 0) return results[0];
     } catch (e) {
       console.log(`[findConversation] filters strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
@@ -274,7 +274,7 @@ function buildMcpServer() {
     // Strategy 2: plain reservationId param (old attempt)
     try {
       const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
-      const results = list.results || list;
+      const results = list.results || list.conversations || list;
       if (Array.isArray(results) && results.length > 0) return results[0];
     } catch (e) {
       console.log(`[findConversation] reservationId strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
@@ -283,7 +283,7 @@ function buildMcpServer() {
     // Strategy 3: no filter — get all, find by scanning
     try {
       const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
-      const results = list.results || list;
+      const results = list.results || list.conversations || list;
       if (Array.isArray(results)) {
         const match = results.find(c =>
           c.reservationId === reservation_id ||
