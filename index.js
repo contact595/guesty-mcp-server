@@ -1,437 +1,423 @@
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
-const crypto = require("crypto");
-const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
-const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
-const { z } = require("zod");
+import express from "express";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { z } from "zod";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
 
-const app = express();
-app.use(cors({ origin: "*" }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+dotenv.config();
 
-const BASE_URL = process.env.BASE_URL || "https://guesty-mcp.onrender.com";
+const GUESTY_API = "https://open-api.guesty.com/v1";
+const TOKEN_URL = "https://auth.guesty.com/oauth/token";
 
-// ─── OAuth stores ─────────────────────────────────────────────────────────────
-const clients = {};
-const authCodes = {};
-const accessTokens = {};
-
-// ─── Guesty Token Cache ───────────────────────────────────────────────────────
+// ── Auth ──────────────────────────────────────────────────────────────────────
 let cachedToken = null;
-let tokenExpiresAt = null;
+let tokenExpiry = 0;
 
-async function getGuestyToken() {
-  if (cachedToken && tokenExpiresAt && Date.now() < tokenExpiresAt) return cachedToken;
-  const res = await axios.post(
-    "https://open-api.guesty.com/oauth2/token",
-    new URLSearchParams({
+async function getToken() {
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
       grant_type: "client_credentials",
       scope: "open-api",
       client_id: process.env.GUESTY_CLIENT_ID,
       client_secret: process.env.GUESTY_CLIENT_SECRET,
     }),
-    { headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" } }
-  );
-  cachedToken = res.data.access_token;
-  tokenExpiresAt = Date.now() + 23 * 60 * 60 * 1000;
+  });
+  const data = await res.json();
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
   return cachedToken;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
+// ── API helper with retry ─────────────────────────────────────────────────────
 async function guestyRequest(method, path, params = {}, body = null, retries = 3) {
-  const token = await getGuestyToken();
-  const config = {
-    method,
-    url: `https://open-api.guesty.com/v1${path}`,
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-  };
+  const token = await getToken();
+  let url = `${GUESTY_API}${path}`;
   if (method === "GET" && Object.keys(params).length) {
-    config.params = params;
-    config.paramsSerializer = (p) =>
-      Object.entries(p).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
-  }
-  if (body) {
-    config.data = body;
-    config.headers["Content-Type"] = "application/json";
+    url += "?" + new URLSearchParams(params).toString();
   }
   for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const res = await axios(config);
-      return res.data;
-    } catch (err) {
-      const status = err.response?.status;
-      const retryAfter = err.response?.headers?.["retry-after"];
-      const detail = JSON.stringify(err.response?.data || err.message);
-      console.error(`[Guesty] ${method} ${path} => ${status} (attempt ${attempt}/${retries}): ${detail}`);
-      if (status === 429 && attempt < retries) {
-        const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 1000;
-        console.log(`[Guesty] Rate limited. Waiting ${waitMs}ms before retry...`);
-        await sleep(waitMs);
-        continue;
-      }
-      throw err;
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 429) {
+      const wait = attempt * 2000;
+      console.log(`Rate limited. Retry ${attempt}/${retries} in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+      continue;
     }
+    const data = await res.json();
+    if (!res.ok) throw new Error(`Guesty ${res.status}: ${JSON.stringify(data)}`);
+    return data;
   }
+  throw new Error("Max retries exceeded");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CONVERSATION CACHE
-// Maps reservationId → conversationId
-// Built once at startup, kept fresh via webhooks
-// ═══════════════════════════════════════════════════════════════════════════
-const conversationCache = new Map(); // reservationId → conversationId
+// ── Conversation Cache ────────────────────────────────────────────────────────
+// Maps reservation_id → conversation_id
+const conversationCache = new Map();
 let cacheReady = false;
-let cacheBuilding = false;
+let cacheError = null;
 
 function indexConversation(convo) {
-  (convo.meta?.reservations || []).forEach(r => {
-    if (r._id) {
-      conversationCache.set(r._id, convo._id);
-    }
+  const reservations = convo.meta?.reservations || [];
+  reservations.forEach(r => {
+    if (r._id) conversationCache.set(r._id, convo._id);
   });
 }
 
-async function buildConversationCache() {
-  if (cacheBuilding) return;
-  cacheBuilding = true;
-  console.log("[Cache] Starting conversation sync (most recent 100)...");
-
+async function buildCache() {
   try {
-    // Fetch most recent 100 conversations — covers all active guests
+    console.log("Building conversation cache...");
     const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
-    const data = list.data || list;
-    const conversations = data.conversations || data.results || [];
-
+    const conversations = list.data?.conversations || list.conversations || [];
     conversations.forEach(indexConversation);
-
     cacheReady = true;
-    console.log(`[Cache] ✅ Ready — indexed ${conversations.length} conversations, ${conversationCache.size} reservations mapped`);
-  } catch (err) {
-    console.error("[Cache] ❌ Build failed:", err.message);
-  } finally {
-    cacheBuilding = false;
+    cacheError = null;
+    console.log(`Cache built: ${conversationCache.size} entries from ${conversations.length} conversations`);
+  } catch (e) {
+    cacheError = e.message;
+    console.error("Cache build failed:", e.message);
   }
 }
 
-// Start building cache after a short delay (let server start first)
-setTimeout(buildConversationCache, 3000);
+// Build cache 30s after startup
+setTimeout(buildCache, 30000);
 
-// ─── Find conversation using cache (instant) ─────────────────────────────────
-async function findConversation(reservation_id) {
-  // Check cache first (instant — no API call)
+// ── Find conversation ID for a reservation ────────────────────────────────────
+async function findConversationId(reservation_id) {
+  // 1. Check in-memory cache first (instant)
   if (conversationCache.has(reservation_id)) {
-    const convoId = conversationCache.get(reservation_id);
-    console.log(`[findConversation] Cache hit: ${convoId} for reservation ${reservation_id}`);
-    return { _id: convoId };
+    return conversationCache.get(reservation_id);
   }
 
-  // Cache miss — fetch fresh from Guesty (single targeted call)
-  console.log(`[findConversation] Cache miss for ${reservation_id} — fetching fresh...`);
+  // 2. Fetch the reservation — check for embedded conversationId
+  try {
+    const res = await guestyRequest("GET", `/reservations/${reservation_id}`, {
+      fields: "conversationId guestId listingId"
+    });
+    
+    // Some Guesty accounts embed the conversationId directly on the reservation
+    if (res.conversationId) {
+      conversationCache.set(reservation_id, res.conversationId);
+      return res.conversationId;
+    }
+
+    // Try filtering conversations by guestId
+    if (res.guestId) {
+      try {
+        const byGuest = await guestyRequest("GET", "/communication/conversations", {
+          limit: 20,
+          guestId: res.guestId
+        });
+        const convos = byGuest.data?.conversations || byGuest.conversations || [];
+        convos.forEach(indexConversation);
+        if (conversationCache.has(reservation_id)) {
+          return conversationCache.get(reservation_id);
+        }
+      } catch (e) { /* guestId filter may not be supported */ }
+    }
+
+    // Try filtering conversations by listingId
+    if (res.listingId) {
+      try {
+        const byListing = await guestyRequest("GET", "/communication/conversations", {
+          limit: 100,
+          listingId: res.listingId
+        });
+        const convos = byListing.data?.conversations || byListing.conversations || [];
+        convos.forEach(indexConversation);
+        if (conversationCache.has(reservation_id)) {
+          return conversationCache.get(reservation_id);
+        }
+      } catch (e) { /* listingId filter may not be supported */ }
+    }
+  } catch (e) {
+    console.log("Reservation lookup error:", e.message);
+  }
+
+  // 3. Fallback: scan top 100 most recent conversations
   try {
     const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
-    const data = list.data || list;
-    const conversations = data.conversations || data.results || [];
-
-    conversations.forEach(indexConversation); // update cache with fresh data
-
-    const match = conversations.find(c =>
-      (c.meta?.reservations || []).some(r => r._id === reservation_id)
-    );
-
-    if (match) {
-      console.log(`[findConversation] Found fresh: ${match._id}`);
-      return match;
+    const convos = list.data?.conversations || list.conversations || [];
+    convos.forEach(indexConversation);
+    if (conversationCache.has(reservation_id)) {
+      return conversationCache.get(reservation_id);
     }
-  } catch (err) {
-    console.error(`[findConversation] Fresh fetch failed: ${err.message}`);
+  } catch (e) {
+    console.log("Fallback scan error:", e.message);
   }
 
-  console.log(`[findConversation] Not found for reservation ${reservation_id}`);
   return null;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// WEBHOOK ENDPOINT
-// Register this URL in Guesty: https://guesty-mcp.onrender.com/webhook
-// Events: reservation.updated, message.created, conversation.created
-// ═══════════════════════════════════════════════════════════════════════════
-app.post("/webhook", (req, res) => {
-  res.sendStatus(200); // Always ack immediately
-
-  const event = req.body;
-  console.log(`[Webhook] Event received: ${event?.event || "unknown"}`);
-
-  try {
-    // Handle new/updated conversation events
-    const convo = event?.data?.conversation || event?.data;
-    if (convo?._id && convo?.meta?.reservations) {
-      indexConversation(convo);
-      console.log(`[Webhook] Cache updated for conversation ${convo._id}`);
-    }
-
-    // Handle message events — conversation ID may be at top level
-    if (event?.data?.conversationId && event?.data?.reservationId) {
-      conversationCache.set(event.data.reservationId, event.data.conversationId);
-      console.log(`[Webhook] Cache updated via message event`);
-    }
-  } catch (err) {
-    console.error("[Webhook] Error processing event:", err.message);
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// OAuth 2.1 Endpoints
-// ═══════════════════════════════════════════════════════════════════════════
-app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.json({ resource: BASE_URL, authorization_servers: [BASE_URL], bearer_methods_supported: ["header"] });
-});
-
-app.get("/.well-known/oauth-authorization-server", (req, res) => {
-  res.json({
-    issuer: BASE_URL,
-    authorization_endpoint: `${BASE_URL}/authorize`,
-    token_endpoint: `${BASE_URL}/token`,
-    registration_endpoint: `${BASE_URL}/register`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
-    code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-  });
-});
-
-app.post("/register", (req, res) => {
-  const clientId = `claude_${crypto.randomBytes(8).toString("hex")}`;
-  clients[clientId] = { client_id: clientId, redirect_uris: req.body.redirect_uris || [], client_name: req.body.client_name || "Claude" };
-  console.log(`[OAuth] Registered: ${clientId}`);
-  res.status(201).json({
-    client_id: clientId, client_secret_expires_at: 0,
-    redirect_uris: clients[clientId].redirect_uris,
-    grant_types: ["authorization_code"], response_types: ["code"],
-    client_name: clients[clientId].client_name,
-  });
-});
-
-app.get("/authorize", (req, res) => {
-  const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
-  if (!client_id || !redirect_uri) return res.status(400).send("Missing required params");
-  const code = crypto.randomBytes(16).toString("hex");
-  authCodes[code] = { client_id, redirect_uri, code_challenge, code_challenge_method, created_at: Date.now() };
-  try {
-    const url = new URL(redirect_uri);
-    url.searchParams.set("code", code);
-    if (state) url.searchParams.set("state", state);
-    res.redirect(url.toString());
-  } catch (e) {
-    res.status(400).send("Invalid redirect_uri");
-  }
-});
-
-app.post("/token", (req, res) => {
-  const { grant_type, code, code_verifier } = req.body;
-  if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
-  const authCode = authCodes[code];
-  if (!authCode) return res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired code" });
-  if (authCode.code_challenge && code_verifier) {
-    const hash = crypto.createHash("sha256").update(code_verifier).digest("base64url");
-    if (hash !== authCode.code_challenge) return res.status(400).json({ error: "invalid_grant", error_description: "PKCE failed" });
-  }
-  const accessToken = crypto.randomBytes(32).toString("hex");
-  accessTokens[accessToken] = { client_id: authCode.client_id, expires_at: Date.now() + 365 * 24 * 60 * 60 * 1000 };
-  delete authCodes[code];
-  res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 31536000 });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MCP Tools
-// ═══════════════════════════════════════════════════════════════════════════
-function buildMcpServer() {
-  const server = new McpServer({ name: "guesty-mcp", version: "3.0.0" });
-
-  server.tool("list_listings", "Get all Guesty property listings for Ventur Group",
-    { limit: z.number().optional().default(25), skip: z.number().optional().default(0) },
-    async ({ limit, skip }) => {
-      const data = await guestyRequest("GET", "/listings", { limit, skip, fields: "_id nickname title address type" });
-      const out = (data.results || data).map(l => ({ id: l._id, nickname: l.nickname, title: l.title, address: l.address?.full, type: l.type }));
-      return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
-    }
+// ── Get posts (actual message content) for a conversation ─────────────────────
+async function getConversationPosts(conversation_id) {
+  const data = await guestyRequest(
+    "GET",
+    `/communication/conversations/${conversation_id}/posts`,
+    { limit: 100 }
   );
-
-  server.tool("get_listing", "Get full details for a single Guesty listing",
-    { listing_id: z.string() },
-    async ({ listing_id }) => {
-      const data = await guestyRequest("GET", `/listings/${listing_id}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool("list_reservations", "Get reservations with optional filters by listing, status, and date range",
-    {
-      listing_id: z.string().optional(),
-      status: z.enum(["inquiry","reserved","confirmed","canceled","declined","expired","closed","checked_in","checked_out"]).optional(),
-      check_in_from: z.string().optional().describe("ISO date e.g. 2025-01-01"),
-      check_in_to: z.string().optional().describe("ISO date e.g. 2025-12-31"),
-      limit: z.number().optional().default(20),
-      skip: z.number().optional().default(0),
-    },
-    async ({ listing_id, status, check_in_from, check_in_to, limit, skip }) => {
-      const filters = [];
-      if (listing_id) filters.push({ field: "listingId", operator: "$in", value: [listing_id] });
-      if (status) filters.push({ field: "status", operator: "$eq", value: status });
-      if (check_in_from) filters.push({ field: "checkInDateLocalized", operator: "$gte", value: check_in_from });
-      if (check_in_to) filters.push({ field: "checkInDateLocalized", operator: "$lte", value: check_in_to });
-      const params = { limit, skip, sort: "_id" };
-      if (filters.length) params.filters = JSON.stringify(filters);
-      const data = await guestyRequest("GET", "/reservations", params);
-      let results = data.results || data;
-      if (listing_id) results = results.filter(r => r.listingId === listing_id);
-      const out = results.map(r => ({
-        id: r._id, confirmationCode: r.confirmationCode, status: r.status,
-        checkIn: r.checkIn, checkOut: r.checkOut, listingId: r.listingId,
-        guestName: r.guest?.fullName, totalPaid: r.money?.totalPaid,
-        currency: r.money?.currency, channel: r.source, nights: r.nightsCount,
-      }));
-      return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
-    }
-  );
-
-  server.tool("get_reservation", "Get full details for a single reservation",
-    { reservation_id: z.string() },
-    async ({ reservation_id }) => {
-      const data = await guestyRequest("GET", `/reservations/${reservation_id}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool("get_reservation_financials", "Get financial breakdown for a reservation",
-    { reservation_id: z.string() },
-    async ({ reservation_id }) => {
-      const data = await guestyRequest("GET", `/reservations/${reservation_id}`);
-      const m = data.money || {};
-      return { content: [{ type: "text", text: JSON.stringify({
-        confirmationCode: data.confirmationCode, currency: m.currency,
-        totalPaid: m.totalPaid, hostPayout: m.hostPayout, cleaningFee: m.cleaningFee,
-        netIncome: m.netIncome, accommodationFare: m.fareAccommodation,
-      }, null, 2) }] };
-    }
-  );
-
-  server.tool("list_guests", "Search Guesty guests by name or email",
-    { search: z.string().optional(), limit: z.number().optional().default(20), skip: z.number().optional().default(0) },
-    async ({ search, limit, skip }) => {
-      const params = { limit, skip };
-      if (search) params.q = search;
-      const data = await guestyRequest("GET", "/guests-crud", params);
-      const out = (data.results || data).map(g => ({ id: g._id, fullName: g.fullName, email: g.email, phone: g.phone }));
-      return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
-    }
-  );
-
-  server.tool("get_guest", "Get full profile for a guest",
-    { guest_id: z.string() },
-    async ({ guest_id }) => {
-      const data = await guestyRequest("GET", `/guests-crud/${guest_id}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
-    { reservation_id: z.string(), message: z.string() },
-    async ({ reservation_id, message }) => {
-      const conversation = await findConversation(reservation_id);
-      if (!conversation) throw new Error("No conversation found for this reservation");
-      const data = await guestyRequest("POST", `/communication/conversations/${conversation._id}/send-message`, {}, { body: message, type: "host" });
-      return { content: [{ type: "text", text: JSON.stringify({ success: true, messageId: data._id }) }] };
-    }
-  );
-
-  server.tool("get_conversation", "Get the message thread for a reservation",
-    { reservation_id: z.string() },
-    async ({ reservation_id }) => {
-      const conversation = await findConversation(reservation_id);
-      if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", reservation_id, cacheReady, cacheSize: conversationCache.size }) }] };
-      const data = await guestyRequest("GET", `/communication/conversations/${conversation._id}/posts`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool("get_availability_calendar", "Get availability calendar for a listing",
-    { listing_id: z.string(), start_date: z.string(), end_date: z.string() },
-    async ({ listing_id, start_date, end_date }) => {
-      const data = await guestyRequest("GET", `/availability-pricing/api/v3/listings/${listing_id}/calendar`, { startDate: start_date, endDate: end_date });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  return server;
+  // Normalize across different response shapes
+  return data.posts || data.data?.posts || data.results || (Array.isArray(data) ? data : []);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Streamable HTTP MCP Endpoint
-// ═══════════════════════════════════════════════════════════════════════════
-const mcpServer = buildMcpServer();
+// ── MCP Server ────────────────────────────────────────────────────────────────
+const server = new McpServer({ name: "guesty-mcp", version: "1.0.0" });
 
-async function handleMcpRequest(req, res) {
+// list_listings
+server.tool("list_listings", "Get all Guesty property listings for Ventur Group", {
+  limit: z.number().default(25),
+  skip: z.number().default(0),
+}, async ({ limit, skip }) => {
+  const data = await guestyRequest("GET", "/listings", {
+    limit, skip, fields: "_id nickname title address"
+  });
+  const listings = data.results || data.listings || data.data?.results || [];
+  return { content: [{ type: "text", text: JSON.stringify(listings) }] };
+});
+
+// get_listing
+server.tool("get_listing", "Get full details for a single Guesty listing", {
+  listing_id: z.string(),
+}, async ({ listing_id }) => {
+  const data = await guestyRequest("GET", `/listings/${listing_id}`);
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+});
+
+// list_reservations
+server.tool("list_reservations", "Get reservations with optional filters by listing, status, and date range", {
+  listing_id: z.string().optional(),
+  status: z.enum(["inquiry","reserved","confirmed","canceled","declined","expired","closed","checked_in","checked_out"]).optional(),
+  check_in_from: z.string().optional().describe("ISO date e.g. 2025-01-01"),
+  check_in_to: z.string().optional().describe("ISO date e.g. 2025-12-31"),
+  limit: z.number().default(20),
+  skip: z.number().default(0),
+}, async ({ listing_id, status, check_in_from, check_in_to, limit, skip }) => {
+  const params = { limit: Math.min(limit * 3, 100), skip };
+  if (status) params.status = status;
+  if (check_in_from) params["checkIn[from]"] = check_in_from;
+  if (check_in_to) params["checkIn[to]"] = check_in_to;
+
+  const data = await guestyRequest("GET", "/reservations", params);
+  let reservations = data.results || data.reservations || data.data?.results || [];
+
+  if (listing_id) {
+    reservations = reservations.filter(r =>
+      r.listingId === listing_id ||
+      r.listing?._id === listing_id ||
+      r.unitTypeId === listing_id
+    );
+  }
+
+  return { content: [{ type: "text", text: JSON.stringify(reservations.slice(0, limit)) }] };
+});
+
+// get_reservation
+server.tool("get_reservation", "Get full details for a single reservation", {
+  reservation_id: z.string(),
+}, async ({ reservation_id }) => {
+  const data = await guestyRequest("GET", `/reservations/${reservation_id}`);
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+});
+
+// get_reservation_financials
+server.tool("get_reservation_financials", "Get financial breakdown for a reservation", {
+  reservation_id: z.string(),
+}, async ({ reservation_id }) => {
+  const data = await guestyRequest("GET", `/reservations/${reservation_id}`, {
+    fields: "money nightlyRate nightsCount totals fareAccommodation cleaningFee"
+  });
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+});
+
+// list_guests
+server.tool("list_guests", "Search Guesty guests by name or email", {
+  search: z.string().optional(),
+  limit: z.number().default(20),
+  skip: z.number().default(0),
+}, async ({ search, limit, skip }) => {
+  const params = { limit, skip };
+  if (search) params.q = search;
+  const data = await guestyRequest("GET", "/guests", params);
+  const guests = data.results || data.guests || [];
+  return { content: [{ type: "text", text: JSON.stringify(guests) }] };
+});
+
+// get_guest
+server.tool("get_guest", "Get full profile for a guest", {
+  guest_id: z.string(),
+}, async ({ guest_id }) => {
+  const data = await guestyRequest("GET", `/guests/${guest_id}`);
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+});
+
+// get_conversation — CORE TOOL for Knowledge Base Builder
+server.tool("get_conversation", "Get the full message thread for a reservation", {
+  reservation_id: z.string(),
+}, async ({ reservation_id }) => {
+  // Find conversation ID
+  const conversationId = await findConversationId(reservation_id);
+
+  if (!conversationId) {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: "No conversation found",
+          reservation_id,
+          note: "Reservation may be Airbnb-native (messages stay on Airbnb) or no messages yet",
+          cacheReady,
+          cacheSize: conversationCache.size
+        })
+      }]
+    };
+  }
+
+  // Get the actual posts/messages
+  let posts = [];
+  try {
+    posts = await getConversationPosts(conversationId);
+  } catch (e) {
+    console.log("Error fetching posts:", e.message);
+  }
+
+  // Normalize to clean message objects
+  const messages = posts
+    .map(post => ({
+      id: post._id,
+      type: post.authorRole === "guest" ? "guest" : "host",
+      authorName: post.authorName || post.author?.fullName || "",
+      body: post.body || post.text || post.message || "",
+      createdAt: post.createdAt || post.date || "",
+      source: post.source || post.channel || ""
+    }))
+    .filter(m => m.body.trim());
+
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({
+        conversation_id: conversationId,
+        reservation_id,
+        total_messages: messages.length,
+        messages
+      })
+    }]
+  };
+});
+
+// send_guest_message
+server.tool("send_guest_message", "Send a message to a guest via Guesty inbox", {
+  reservation_id: z.string(),
+  message: z.string(),
+}, async ({ reservation_id, message }) => {
+  const conversationId = await findConversationId(reservation_id);
+  if (!conversationId) {
+    throw new Error(`No conversation found for reservation ${reservation_id}`);
+  }
+  const result = await guestyRequest(
+    "POST",
+    `/communication/conversations/${conversationId}/send-message`,
+    {},
+    { body: message }
+  );
+  return { content: [{ type: "text", text: JSON.stringify({ success: true, result }) }] };
+});
+
+// get_availability_calendar
+server.tool("get_availability_calendar", "Get availability calendar for a listing", {
+  listing_id: z.string(),
+  start_date: z.string(),
+  end_date: z.string(),
+}, async ({ listing_id, start_date, end_date }) => {
+  const data = await guestyRequest(
+    "GET",
+    `/availability-pricing/api/calendar/listings/${listing_id}`,
+    { startDate: start_date, endDate: end_date }
+  );
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+});
+
+// ── Webhook handler ───────────────────────────────────────────────────────────
+function handleWebhookEvent(payload) {
+  try {
+    if (payload.conversation?._id) {
+      indexConversation(payload.conversation);
+    }
+    if (payload.reservationId && payload.conversationId) {
+      conversationCache.set(payload.reservationId, payload.conversationId);
+    }
+    const data = payload.data || {};
+    if (data.reservationId && data.conversationId) {
+      conversationCache.set(data.reservationId, data.conversationId);
+    }
+  } catch (e) {
+    console.error("Webhook error:", e);
+  }
+}
+
+// ── Express App ───────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+app.get("/health", (req, res) => res.json({
+  status: "ok",
+  cacheReady,
+  cacheSize: conversationCache.size,
+  cacheError,
+  uptime: Math.round(process.uptime())
+}));
+
+app.post("/cache/rebuild", async (req, res) => {
+  buildCache();
+  res.json({ status: "rebuilding" });
+});
+
+app.get("/test", async (req, res) => {
+  const { reservation_id } = req.query;
+  if (!reservation_id) return res.json({ error: "reservation_id required" });
+  const convoId = await findConversationId(reservation_id).catch(() => null);
+  res.json({ reservation_id, conversation_id: convoId, cacheSize: conversationCache.size });
+});
+
+app.post("/webhook", (req, res) => {
+  handleWebhookEvent(req.body);
+  res.sendStatus(200);
+});
+
+// SSE transport
+const sseTransports = {};
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  sseTransports[transport.sessionId] = transport;
+  await server.connect(transport);
+});
+app.post("/messages", async (req, res) => {
+  const transport = sseTransports[req.query.sessionId];
+  if (!transport) return res.status(404).json({ error: "Session not found" });
+  await transport.handlePostMessage(req, res, req.body);
+});
+
+// StreamableHTTP transport
+app.all("/mcp", async (req, res) => {
   try {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    await mcpServer.connect(transport);
+    await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-    res.on("finish", () => transport.close());
-    res.on("close", () => transport.close());
-  } catch (err) {
-    console.error("[MCP error]", err);
-    if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
-}
-
-app.post("/mcp", handleMcpRequest);
-app.get("/mcp", handleMcpRequest);
-app.delete("/mcp", handleMcpRequest);
-
-// ─── Health + Cache Status ────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "guesty-mcp",
-    version: "5.0.0",
-    cache: {
-      ready: cacheReady,
-      building: cacheBuilding,
-      size: conversationCache.size,
-    }
-  });
 });
 
-// ─── Force cache rebuild ──────────────────────────────────────────────────────
-app.post("/cache/rebuild", (req, res) => {
-  conversationCache.clear();
-  cacheReady = false;
-  buildConversationCache();
-  res.json({ message: "Cache rebuild started" });
-});
-
-// ─── Test endpoint ────────────────────────────────────────────────────────────
-app.get("/test", (req, res) => {
-  const { reservation_id } = req.query;
-  if (!reservation_id) return res.json({ cacheReady, cacheSize: conversationCache.size });
-  const conversationId = conversationCache.get(reservation_id);
-  res.json({
-    reservation_id,
-    cacheReady,
-    cacheSize: conversationCache.size,
-    found: !!conversationId,
-    conversationId: conversationId || null,
-  });
-});
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Guesty MCP v5 running on port ${PORT}`);
-  console.log(`MCP endpoint: ${BASE_URL}/mcp`);
-  console.log(`Webhook endpoint: ${BASE_URL}/webhook`);
-  console.log(`Cache status: ${BASE_URL}/health`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Guesty MCP running on port ${PORT}`));
