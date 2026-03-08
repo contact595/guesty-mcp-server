@@ -259,26 +259,63 @@ function buildMcpServer() {
     }
   );
 
-  // ── FIXED: look up conversation by reservationId first, then send message ──
+  // ── Helper: find conversation by reservation ID ────────────────────────────
+  async function findConversation(reservation_id) {
+    // Strategy 1: filters JSON array (like /reservations endpoint)
+    try {
+      const filters = JSON.stringify([{ field: "reservationId", operator: "$eq", value: reservation_id }]);
+      const list = await guestyRequest("GET", "/communication/conversations", { filters, limit: 1 });
+      const results = list.results || list;
+      if (Array.isArray(results) && results.length > 0) return results[0];
+    } catch (e) {
+      console.log(`[findConversation] filters strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
+    }
+
+    // Strategy 2: plain reservationId param (old attempt)
+    try {
+      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
+      const results = list.results || list;
+      if (Array.isArray(results) && results.length > 0) return results[0];
+    } catch (e) {
+      console.log(`[findConversation] reservationId strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
+    }
+
+    // Strategy 3: no filter — get all, find by scanning
+    try {
+      const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
+      const results = list.results || list;
+      if (Array.isArray(results)) {
+        const match = results.find(c =>
+          c.reservationId === reservation_id ||
+          (c.meta?.reservations || []).some(r => r._id === reservation_id)
+        );
+        if (match) return match;
+      }
+    } catch (e) {
+      console.log(`[findConversation] no-filter strategy failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
+    }
+
+    return null;
+  }
+
+  // ── send_guest_message ─────────────────────────────────────────────────────
   server.tool("send_guest_message", "Send a message to a guest via Guesty inbox",
     { reservation_id: z.string(), message: z.string() },
     async ({ reservation_id, message }) => {
-      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
-      const conversation = (list.results || list)[0];
+      const conversation = await findConversation(reservation_id);
       if (!conversation) throw new Error("No conversation found for this reservation");
       const data = await guestyRequest("POST", `/communication/conversations/${conversation._id}/send-message`, {}, { body: message, type: "host" });
       return { content: [{ type: "text", text: JSON.stringify({ success: true, messageId: data._id }) }] };
     }
   );
 
-  // ── FIXED: look up conversation by reservationId first, then fetch full thread ──
+  // ── get_conversation ───────────────────────────────────────────────────────
   server.tool("get_conversation", "Get the message thread for a reservation",
     { reservation_id: z.string() },
     async ({ reservation_id }) => {
-      const list = await guestyRequest("GET", "/communication/conversations", { reservationId: reservation_id, limit: 1 });
-      console.log(`[get_conversation] /conversations?reservationId=${reservation_id} => count: ${(list.results || list).length}`);
-      const conversation = (list.results || list)[0];
+      const conversation = await findConversation(reservation_id);
       if (!conversation) return { content: [{ type: "text", text: JSON.stringify({ error: "No conversation found", reservation_id }) }] };
+      console.log(`[get_conversation] found conversation ${conversation._id} for reservation ${reservation_id}`);
       const data = await guestyRequest("GET", `/communication/conversations/${conversation._id}/posts`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
