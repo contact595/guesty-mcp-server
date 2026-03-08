@@ -370,13 +370,7 @@ function handleWebhookEvent(payload) {
 const app = express();
 app.use(express.json());
 
-app.get("/health", (req, res) => res.json({
-  status: "ok",
-  cacheReady,
-  cacheSize: conversationCache.size,
-  cacheError,
-  uptime: Math.round(process.uptime())
-}));
+
 
 app.post("/cache/rebuild", async (req, res) => {
   buildCache();
