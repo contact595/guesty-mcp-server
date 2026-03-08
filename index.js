@@ -3,10 +3,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
-import dotenv from "dotenv";
-
-dotenv.config();
-
 const GUESTY_API = "https://open-api.guesty.com/v1";
 const TOKEN_URL = "https://auth.guesty.com/oauth/token";
 
