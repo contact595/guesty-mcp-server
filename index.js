@@ -7,11 +7,29 @@ const GUESTY_API = "https://open-api.guesty.com/v1";
 const TOKEN_URL = "https://open-api.guesty.com/oauth2/token";
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-let cachedToken = null;
-let tokenExpiry = 0;
+// Token persisted in env so it survives Render cold starts
+// GUESTY_CACHED_TOKEN and GUESTY_TOKEN_EXPIRY are set at runtime (in-memory across requests)
+let cachedToken = process.env.GUESTY_CACHED_TOKEN || null;
+let tokenExpiry = parseInt(process.env.GUESTY_TOKEN_EXPIRY || "0");
 
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+
+  // Enforce minimum 60s between auth calls to avoid 429
+  const now = Date.now();
+  const lastAuthAttempt = parseInt(global._lastAuthAttempt || 0);
+  if (now - lastAuthAttempt < 60000) {
+    // Too soon — reuse stale token if we have one rather than hammering auth
+    if (cachedToken) {
+      console.log("getToken: throttled, reusing existing token");
+      return cachedToken;
+    }
+    const wait = 60000 - (now - lastAuthAttempt);
+    console.log(`getToken: throttled, waiting ${wait}ms`);
+    await new Promise(r => setTimeout(r, wait));
+  }
+  global._lastAuthAttempt = Date.now();
+
   let res;
   try {
     const params = new URLSearchParams();
@@ -40,12 +58,46 @@ async function getToken() {
   }
   cachedToken = data.access_token;
   tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  console.log("getToken: OK, expires in", data.expires_in, "s");
+  console.log("getToken: NEW token obtained, expires in", data.expires_in, "s");
   return cachedToken;
 }
 
+// ── Request Queue (rate limit protection) ────────────────────────────────────
+// Guesty allows ~15 req/sec. We serialize all calls with 150ms spacing.
+const requestQueue = [];
+let queueRunning = false;
+
+async function enqueue(fn) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ fn, resolve, reject });
+    if (!queueRunning) drainQueue();
+  });
+}
+
+async function drainQueue() {
+  queueRunning = true;
+  while (requestQueue.length > 0) {
+    const { fn, resolve, reject } = requestQueue.shift();
+    try {
+      const result = await fn();
+      resolve(result);
+    } catch (e) {
+      reject(e);
+    }
+    if (requestQueue.length > 0) {
+      await new Promise(r => setTimeout(r, 600)); // 600ms between calls (~100 req/min, under 120/min limit)
+    }
+  }
+  queueRunning = false;
+}
+
+
 // ── API helper with retry ─────────────────────────────────────────────────────
 async function guestyRequest(method, path, params = {}, body = null, retries = 3) {
+  return enqueue(() => _guestyRequest(method, path, params, body, retries));
+}
+
+async function _guestyRequest(method, path, params = {}, body = null, retries = 3) {
   const token = await getToken();
   let url = `${GUESTY_API}${path}`;
   if (method === "GET" && Object.keys(params).length) {
@@ -78,6 +130,7 @@ async function guestyRequest(method, path, params = {}, body = null, retries = 3
 const conversationCache = new Map();
 let cacheReady = false;
 let cacheError = null;
+let cacheBuilding = false;
 
 function indexConversation(convo) {
   const reservations = convo.meta?.reservations || [];
@@ -87,28 +140,39 @@ function indexConversation(convo) {
 }
 
 async function buildCache() {
+  if (cacheBuilding) return;
+  cacheBuilding = true;
   try {
     console.log("Building conversation cache...");
     const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
     const conversations = list.data?.conversations || list.conversations || [];
     conversations.forEach(indexConversation);
     cacheReady = true;
+    cacheBuilding = false;
     cacheError = null;
     console.log(`Cache built: ${conversationCache.size} entries from ${conversations.length} conversations`);
   } catch (e) {
     cacheError = e.message;
+    cacheBuilding = false;
     console.error("Cache build failed:", e.message);
   }
 }
 
-// Build cache 30s after startup
-setTimeout(buildCache, 30000);
+// Cache is built lazily on first tool use (no startup hammering)
 
 // ── Find conversation ID for a reservation ────────────────────────────────────
 async function findConversationId(reservation_id) {
   // 1. Check in-memory cache first (instant)
   if (conversationCache.has(reservation_id)) {
     return conversationCache.get(reservation_id);
+  }
+
+  // Lazy cache build: if cache has never been populated, build it now
+  if (!cacheReady && !cacheBuilding) {
+    await buildCache();
+    if (conversationCache.has(reservation_id)) {
+      return conversationCache.get(reservation_id);
+    }
   }
 
   // 2. Fetch the reservation — check for embedded conversationId
