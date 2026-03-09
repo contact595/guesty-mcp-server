@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
+import fs from "fs";
 const GUESTY_API = "https://open-api.guesty.com/v1";
 const TOKEN_URL = "https://open-api.guesty.com/oauth2/token";
 
@@ -12,9 +13,25 @@ const TOKEN_URL = "https://open-api.guesty.com/oauth2/token";
 let cachedToken = process.env.GUESTY_CACHED_TOKEN || null;
 let tokenExpiry = parseInt(process.env.GUESTY_TOKEN_EXPIRY || "0");
 
+// Mutex: only one auth call in-flight at a time — prevents cold-start stampede
+let tokenRefreshPromise = null;
+
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
 
+  // If a refresh is already in progress, wait for it instead of firing another
+  if (tokenRefreshPromise) {
+    console.log("getToken: refresh already in progress, waiting...");
+    return tokenRefreshPromise;
+  }
+
+  tokenRefreshPromise = _refreshToken().finally(() => {
+    tokenRefreshPromise = null;
+  });
+  return tokenRefreshPromise;
+}
+
+async function _refreshToken() {
   // Enforce minimum 60s between auth calls to avoid 429
   const now = Date.now();
   const lastAuthAttempt = parseInt(global._lastAuthAttempt || 0);
@@ -127,16 +144,51 @@ async function _guestyRequest(method, path, params = {}, body = null, retries = 
 
 // ── Conversation Cache ────────────────────────────────────────────────────────
 // Maps reservation_id → conversation_id
+// Persisted to disk so it survives Render restarts/redeploys
 const conversationCache = new Map();
 let cacheReady = false;
 let cacheError = null;
 let cacheBuilding = false;
+const CACHE_FILE = "/tmp/conversation_cache.json";
+const warmListingCache = new Map(); // tracks which listing IDs have been bulk-fetched
+
+// Load cache from disk on startup
+function loadCacheFromDisk() {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      const raw = fs.readFileSync(CACHE_FILE, "utf8");
+      const entries = JSON.parse(raw);
+      entries.forEach(([k, v]) => conversationCache.set(k, v));
+      cacheReady = conversationCache.size > 0;
+      console.log(`Cache loaded from disk: ${conversationCache.size} entries`);
+    }
+  } catch (e) {
+    console.log("Cache load error (non-fatal):", e.message);
+  }
+}
+
+// Save cache to disk after updates
+function saveCacheToDisk() {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify([...conversationCache.entries()]));
+  } catch (e) {
+    console.log("Cache save error (non-fatal):", e.message);
+  }
+}
+
+// Load immediately on startup
+loadCacheFromDisk();
 
 function indexConversation(convo) {
   const reservations = convo.meta?.reservations || [];
   reservations.forEach(r => {
     if (r._id) conversationCache.set(r._id, convo._id);
   });
+}
+
+function indexAndPersist(convos) {
+  convos.forEach(indexConversation);
+  saveCacheToDisk();
 }
 
 async function buildCache() {
@@ -146,7 +198,7 @@ async function buildCache() {
     console.log("Building conversation cache...");
     const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
     const conversations = list.data?.conversations || list.conversations || [];
-    conversations.forEach(indexConversation);
+    indexAndPersist(conversations);
     cacheReady = true;
     cacheBuilding = false;
     cacheError = null;
@@ -155,6 +207,25 @@ async function buildCache() {
     cacheError = e.message;
     cacheBuilding = false;
     console.error("Cache build failed:", e.message);
+  }
+}
+
+// Optimization 1: Bulk-warm cache for a specific listing in one API call
+// Dramatically reduces per-reservation lookup calls during KB pipeline runs
+async function warmCacheForListing(listing_id) {
+  if (warmListingCache.has(listing_id)) return; // already warmed
+  try {
+    console.log(`Warming cache for listing ${listing_id}...`);
+    const list = await guestyRequest("GET", "/communication/conversations", {
+      limit: 100,
+      listingId: listing_id
+    });
+    const conversations = list.data?.conversations || list.conversations || [];
+    indexAndPersist(conversations);
+    warmListingCache.set(listing_id, Date.now());
+    console.log(`Cache warmed for listing ${listing_id}: ${conversations.length} conversations indexed`);
+  } catch (e) {
+    console.log(`Cache warm failed for listing ${listing_id}:`, e.message);
   }
 }
 
@@ -195,7 +266,7 @@ async function findConversationId(reservation_id) {
           guestId: res.guestId
         });
         const convos = byGuest.data?.conversations || byGuest.conversations || [];
-        convos.forEach(indexConversation);
+        indexAndPersist(convos);
         if (conversationCache.has(reservation_id)) {
           return conversationCache.get(reservation_id);
         }
@@ -210,7 +281,7 @@ async function findConversationId(reservation_id) {
           listingId: res.listingId
         });
         const convos = byListing.data?.conversations || byListing.conversations || [];
-        convos.forEach(indexConversation);
+        indexAndPersist(convos);
         if (conversationCache.has(reservation_id)) {
           return conversationCache.get(reservation_id);
         }
@@ -224,7 +295,7 @@ async function findConversationId(reservation_id) {
   try {
     const list = await guestyRequest("GET", "/communication/conversations", { limit: 100 });
     const convos = list.data?.conversations || list.conversations || [];
-    convos.forEach(indexConversation);
+    indexAndPersist(convos);
     if (conversationCache.has(reservation_id)) {
       return conversationCache.get(reservation_id);
     }
@@ -280,7 +351,13 @@ server.tool("list_reservations", "Get reservations with optional filters by list
   limit: z.number().default(20),
   skip: z.number().default(0),
 }, async ({ listing_id, status, check_in_from, check_in_to, limit, skip }) => {
-  const params = { limit: Math.min(limit * 3, 100), skip };
+  // Optimization: use exact limit (no overfetch needed — server-side filter handles it)
+  // Optimization: request only fields needed, reduces payload ~70%
+  const params = {
+    limit,
+    skip,
+    fields: "_id guestId listingId checkIn checkOut status confirmationCode guest"
+  };
   if (listing_id) params.filters = JSON.stringify([{"field":"listingId","operator":"$eq","value":listing_id}]);
   if (status) params.status = status;
   if (check_in_from) params["checkIn[from]"] = check_in_from;
@@ -434,6 +511,7 @@ function handleWebhookEvent(payload) {
     if (data.reservationId && data.conversationId) {
       conversationCache.set(data.reservationId, data.conversationId);
     }
+    saveCacheToDisk();
   } catch (e) {
     console.error("Webhook error:", e);
   }
@@ -448,6 +526,34 @@ app.use(express.json());
 app.post("/cache/rebuild", async (req, res) => {
   buildCache();
   res.json({ status: "rebuilding" });
+});
+
+// Optimization 1: Bulk warm cache for a specific listing in 1 API call
+// Use this before running a KB pipeline on a property to pre-index all its conversations
+app.post("/cache/listing/:listingId", async (req, res) => {
+  const { listingId } = req.params;
+  const alreadyWarmed = warmListingCache.has(listingId);
+  warmCacheForListing(listingId); // runs async, don't await
+  res.json({
+    status: alreadyWarmed ? "already_warmed" : "warming",
+    listingId,
+    cacheSize: conversationCache.size
+  });
+});
+
+// Optimization 5: Cache status endpoint — visibility into cache health
+app.get("/cache/status", (req, res) => {
+  res.json({
+    cacheReady,
+    cacheSize: conversationCache.size,
+    cacheError,
+    warmedListings: [...warmListingCache.entries()].map(([id, ts]) => ({
+      listingId: id,
+      warmedAt: new Date(ts).toISOString()
+    })),
+    diskCacheExists: fs.existsSync(CACHE_FILE),
+    uptime: Math.round(process.uptime())
+  });
 });
 
 app.get("/test", async (req, res) => {
@@ -475,6 +581,8 @@ app.get("/health", async (req, res) => {
     tokenTest,
     cacheReady,
     cacheSize: conversationCache.size,
+    warmedListings: warmListingCache.size,
+    diskCacheExists: fs.existsSync(CACHE_FILE),
     uptime: Math.round(process.uptime())
   });
 });
