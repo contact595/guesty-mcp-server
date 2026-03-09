@@ -403,28 +403,23 @@ app.get("/test", async (req, res) => {
 app.get("/health", async (req, res) => {
   const clientId = process.env.GUESTY_CLIENT_ID;
   const clientSecret = process.env.GUESTY_CLIENT_SECRET;
-  const envStatus = {
-    GUESTY_CLIENT_ID: clientId ? `set (${clientId.slice(0,8)}...)` : "MISSING",
-    GUESTY_CLIENT_SECRET: clientSecret ? `set (length=${clientSecret.length})` : "MISSING",
-  };
   let tokenTest = null;
   try {
-    const hp = new URLSearchParams();
-    hp.append("grant_type", "client_credentials");
-    hp.append("scope", "open-api");
-    hp.append("client_id", clientId);
-    hp.append("client_secret", clientSecret);
-    const r = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: hp.toString(),
-    });
-    const d = await r.json();
-    tokenTest = r.ok ? `OK (token length=${d.access_token?.length})` : `FAILED ${r.status}: ${JSON.stringify(d)}`;
+    const token = await getToken();
+    tokenTest = token ? `OK (token length=${token.length})` : "No token returned";
   } catch (e) {
-    tokenTest = `FETCH ERROR: ${e.message} | cause: ${e.cause?.message || 'none'} | code: ${e.cause?.code || 'none'}`;
+    tokenTest = `ERROR: ${e.message}`;
   }
-  res.json({ env: envStatus, tokenTest, cacheReady, cacheSize: conversationCache.size });
+  res.json({
+    env: {
+      GUESTY_CLIENT_ID: clientId ? `set (${clientId.slice(0,8)}...)` : "MISSING",
+      GUESTY_CLIENT_SECRET: clientSecret ? `set (length=${clientSecret.length})` : "MISSING",
+    },
+    tokenTest,
+    cacheReady,
+    cacheSize: conversationCache.size,
+    uptime: Math.round(process.uptime())
+  });
 });
 
 app.post("/webhook", (req, res) => {
